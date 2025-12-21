@@ -1,0 +1,11 @@
+[package]
+name = "blink_01"
+version = "0.1.0"
+authors = ["Srideep Chatterjee <srideep007@gmail.com>"]
+edition = "2024"
+
+[dependencies]
+# cortex-m = "0.7.7" - Pulled in by stm32f407g-disc
+# cortex-m-rt = "0.7.5" - Pulled in by stm32f407g-disc
+panic-halt = "1.0.0"
+stm32f407g-disc = "0.4.1"
