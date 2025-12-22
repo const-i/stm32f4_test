@@ -1,4 +1,24 @@
-# `app-template`
+# App Template - Rust Embedded
+
+Based on the Rust Embedded book: <https://docs.rust-embedded.org/book/start/qemu.html>
+
+Specifically, uses the template linked here: <https://github.com/rust-embedded/cortex-m-quickstart>    -- This is depricated
+
+Hence, we use the template linked here: <https://github.com/knurling-rs/app-template>
+
+With the files in this repo, we are able to run the following commands:
+
+```
+cargo build --bin blink
+
+cargo run --bin blink
+
+cargo embed -bin blink --release
+```
+
+
+
+## `app-template`
 
 > Quickly set up a [`probe-rs`] + [`defmt`] + [`flip-link`] embedded project
 
