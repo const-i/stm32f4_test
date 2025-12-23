@@ -9,11 +9,11 @@ Hence, we use the template linked here: <https://github.com/knurling-rs/app-temp
 With the files in this repo, we are able to run the following commands:
 
 ```
-cargo build --bin blink
+cargo build
 
-cargo run --bin blink
+cargo run
 
-cargo embed -bin blink --release
+cargo embed
 ```
 
 
