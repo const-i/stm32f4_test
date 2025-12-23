@@ -1,6 +1,6 @@
 # STM32F407 - Discovery Board
 
-Testing Rust on the STM32F4-Discovery Board
+Learning embedded Rust on the STM32F4-Discovery Board
 
 blink_01 - Blink example using the BSP (Board Support Package) for the STM32F407-Discovery Board: [`stm32f407g-disc`]
 
