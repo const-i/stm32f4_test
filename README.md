@@ -22,3 +22,9 @@ blink_04 - Blink using [`probe-rs`] + [`defmt`] + [`flip-link`] embedded project
 blink_05 - Blink example from the [`Embassy Framework`]
 
 [`Embassy Framework`]: https://github.com/embassy-rs/embassy
+
+dac_01 - Sine wave output example from [`Embassy`]
+
+[`Embassy`]: https://github.com/embassy-rs/embassy/blob/main/examples/stm32f4/src/bin/dac.rs
+
+dac_02 - Sine wave of a specific freq (440 Hz) - This only gets to about 430 Hz when built with --release
