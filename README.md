@@ -28,3 +28,5 @@ dac_01 - Sine wave output example from [`Embassy`]
 [`Embassy`]: https://github.com/embassy-rs/embassy/blob/main/examples/stm32f4/src/bin/dac.rs
 
 dac_02 - Sine wave of a specific freq (440 Hz) - This only gets to about 430 Hz when built with --release
+
+acd_01 - ADC + DAC with brute force writing single values from ADC to DAC.
