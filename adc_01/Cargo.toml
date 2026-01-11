@@ -1,0 +1,23 @@
+[package]
+name = "adc_01"
+version = "0.1.0"
+authors = ["Srideep Chatterjee <srideep007@gmail.com>"]
+edition = "2024"
+
+[dependencies]
+defmt = "1.0"
+defmt-rtt = "1.1"
+cortex-m-rt = "0.7.3"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+cortex-m = { version = "0.7.7", features = ["critical-section-single-core"] }
+embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "defmt", "executor-interrupt", "executor-thread"] }
+embassy-stm32 = { version = "0.5.0", features = ["defmt", "memory-x", "stm32f407vg", "time-driver-any"] }
+embassy-time = { version = "0.5.0", features = ["defmt"] }
+
+
+[profile.release]
+debug = true
+codegen-units = 1
+opt-level = "s"
+lto = true
+overflow-checks = false
