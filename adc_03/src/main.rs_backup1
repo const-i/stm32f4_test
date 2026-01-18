@@ -1,0 +1,204 @@
+#![no_main]
+#![no_std]
+
+use {defmt_rtt as _, panic_probe as _};
+use defmt::*;
+
+use embassy_executor::Spawner;
+use embassy_stm32::adc::{Adc, AdcChannel, RegularConversionMode, RingBufferedAdc, SampleTime};
+use embassy_stm32::dac::{Dac, DacCh1, ValueArray};
+use embassy_stm32::mode::Async;
+use embassy_stm32::peripherals::{ADC1, DAC1};
+use embassy_stm32::{init, Config};
+use embassy_time::{Duration, Instant, Timer};
+
+use embassy_stm32::rcc::{Hse, HseMode};
+use embassy_stm32::time::Hertz;
+
+use cortex_m::singleton;
+use cortex_m::interrupt::{self, Mutex};
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+const BUF_SIZE: usize = 4096;
+const HALF_SIZE: usize = BUF_SIZE / 2;
+const SAMPLE_RATE_HZ: u64 = 96_000;
+
+// Shared buffers wrapped in Mutex<RefCell<...>> for safe access
+static PROC_BUF: Mutex<RefCell<Option<&'static mut [u16; BUF_SIZE]>>> = Mutex::new(RefCell::new(None));
+static DAC_BUF: Mutex<RefCell<Option<&'static mut [u16; BUF_SIZE]>>> = Mutex::new(RefCell::new(None));
+
+// Atomic counters for synchronization
+// HALF_COUNTER increments when ADC writes a half into PROC_BUF.
+// PROCESSED_COUNTER increments when processing copies that half into DAC_BUF.
+static HALF_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static PROCESSED_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    info!("Starting STM32F407 audio pipeline at 48 kHz");
+
+    let mut config = Config::default();
+    config.rcc.hse = Some(Hse {
+        freq: Hertz::mhz(8), // Change to your crystal (e.g., 25 MHz)
+        mode: HseMode::Oscillator,
+    });
+
+    let p = init(config);
+
+    // Private ADC DMA buffer (owned by the ring-buffered ADC)
+    let adc_dma_buf: &'static mut [u16; BUF_SIZE] =
+        singleton!(: [u16; BUF_SIZE] = [0; BUF_SIZE]).expect("ADC DMA buffer singleton");
+
+    // Processing buffer (ADC task writes into; processing task reads from)
+    let proc_buf: &'static mut [u16; BUF_SIZE] =
+        singleton!(: [u16; BUF_SIZE] = [0; BUF_SIZE]).expect("PROC buffer singleton");
+
+    // DAC buffer (processing task writes into; DAC task streams)
+    let dac_buf: &'static mut [u16; BUF_SIZE] =
+        singleton!(: [u16; BUF_SIZE] = [0; BUF_SIZE]).expect("DAC buffer singleton");
+
+    // ADC setup: single channel PA0, ring-buffered DMA using its private buffer
+    let adc = Adc::new_with_config(p.ADC1, Default::default());
+    let adc_rb: RingBufferedAdc<ADC1> = adc.into_ring_buffered(
+        p.DMA2_CH0,
+        &mut adc_dma_buf[..],
+        [(p.PA0.degrade_adc(), SampleTime::CYCLES144)].into_iter(),
+        RegularConversionMode::Continuous,
+    );
+
+    // Publish PROC and DAC buffers for shared access
+    interrupt::free(|cs| {
+        PROC_BUF.borrow(cs).replace(Some(proc_buf));
+        DAC_BUF.borrow(cs).replace(Some(dac_buf));
+    });
+
+    // DAC setup: channel 1 on PA4, DMA
+    let (dac_ch, _dac_ch2) = Dac::new(p.DAC1, p.DMA1_CH5, p.DMA1_CH6, p.PA4, p.PA5).split();
+
+    // Spawn tasks
+    spawner.spawn(adc_task(adc_rb)).unwrap();
+    spawner.spawn(process_task()).unwrap();
+    spawner.spawn(dac_task(dac_ch)).unwrap();
+}
+
+/// ADC task paced at 48 kHz: reads samples and writes into PROC_BUF halves.
+/// This uses software pacing to ensure a fixed sample rate.
+/// If your Embassy version supports timer-triggered ADC, replace this with hardware trigger.
+#[embassy_executor::task]
+async fn adc_task(mut adc_rb: RingBufferedAdc<'static, ADC1>) {
+    let period = Duration::from_hz(SAMPLE_RATE_HZ);
+
+    loop {
+        let t0 = Instant::now();
+        let mut half_buf = [0u16; HALF_SIZE];
+
+        match adc_rb.read(&mut half_buf).await {
+            Ok(_) => {
+                // Determine which half to write based on HALF_COUNTER parity
+                let n = HALF_COUNTER.load(Ordering::Relaxed);
+                let write_first_half = n % 2 == 0;
+
+                interrupt::free(|cs| {
+                    if let Some(buf) = PROC_BUF.borrow(cs).borrow_mut().as_mut() {
+                        if write_first_half {
+                            buf[0..HALF_SIZE].copy_from_slice(&half_buf);
+                            trace!("ADC wrote first half into PROC_BUF");
+                        } else {
+                            buf[HALF_SIZE..BUF_SIZE].copy_from_slice(&half_buf);
+                            trace!("ADC wrote second half into PROC_BUF");
+                        }
+                    }
+                });
+
+                // Increment half-counter
+                HALF_COUNTER.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                warn!("ADC read error: {:?}", e);
+            }
+        }
+
+        let elapsed = Instant::now() - t0;
+        if elapsed < period {
+            Timer::after(period - elapsed).await;
+        }
+    }
+}
+
+/// Processing task: applies gain=1 (copy) from PROC_BUF to DAC_BUF
+/// when half/full buffer boundaries are reached, based on HALF_COUNTER.
+/// It increments PROCESSED_COUNTER after each half is processed.
+#[embassy_executor::task]
+async fn process_task() {
+    let mut last_processed = 0usize;
+
+    loop {
+        let n = HALF_COUNTER.load(Ordering::Relaxed);
+
+        if n > last_processed {
+            let half_to_process = last_processed % 2; // 0 -> first half, 1 -> second half
+
+            interrupt::free(|cs| {
+                let proc_opt = PROC_BUF.borrow(cs).borrow();
+                let mut dac_opt = DAC_BUF.borrow(cs).borrow_mut();
+
+                if let (Some(proc_buf), Some(dac_buf)) = (proc_opt.as_ref(), dac_opt.as_mut()) {
+                    match half_to_process {
+                        0 => {
+                            apply_gain_copy(&proc_buf[0..HALF_SIZE], &mut dac_buf[0..HALF_SIZE]);
+                            debug!("Processed first half");
+                        }
+                        _ => {
+                            apply_gain_copy(&proc_buf[HALF_SIZE..BUF_SIZE], &mut dac_buf[HALF_SIZE..BUF_SIZE]);
+                            debug!("Processed second half");
+                        }
+                    }
+                }
+            });
+
+            // Mark this half as processed
+            PROCESSED_COUNTER.fetch_add(1, Ordering::Relaxed);
+            last_processed += 1;
+        } else {
+            // No new half yet—sleep briefly to avoid busy-waiting
+            Timer::after_millis(1).await;
+        }
+    }
+}
+
+/// DAC task: waits for fresh processed halves and writes the DAC buffer via DMA.
+/// It only writes after PROCESSED_COUNTER advances, ensuring no stale output.
+#[embassy_executor::task]
+async fn dac_task(mut dac_ch: DacCh1<'static, DAC1, Async>) {
+    dac_ch.enable();
+
+    let mut last_written = 0usize;
+
+    loop {
+        let processed = PROCESSED_COUNTER.load(Ordering::Relaxed);
+
+        if processed > last_written {
+            // Fresh data available—write the entire DAC buffer.
+            // true = circular mode (restarts automatically). This will stream until next update.
+            interrupt::free(|cs| {
+                if let Some(buf) = DAC_BUF.borrow(cs).borrow().as_ref() {
+                    let _ = dac_ch.write(ValueArray::Bit12Left(&buf[..]), true);
+                }
+            });
+
+            last_written = processed;
+        } else {
+            // Wait briefly for new processed data
+            Timer::after_millis(1).await;
+        }
+    }
+}
+
+/// Gain function: gain=1 (copy), saturating to 12-bit DAC range.
+fn apply_gain_copy(input: &[u16], output: &mut [u16]) {
+    for (i, o) in input.iter().zip(output.iter_mut()) {
+        let v = (*i).min(4095);
+        *o = v;
+    }
+}

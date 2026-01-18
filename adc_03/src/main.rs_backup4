@@ -1,0 +1,70 @@
+#![no_main]
+#![no_std]
+
+use {defmt_rtt as _, panic_probe as _};
+use defmt::*;
+
+use embassy_executor::Spawner;
+use embassy_stm32::adc::{Adc, AdcChannel, RegularConversionMode, RingBufferedAdc, SampleTime};
+use embassy_stm32::dac::{DacCh1, Value};
+use embassy_stm32::peripherals::ADC1;
+use embassy_stm32::{init, Config};
+use embassy_stm32::rcc::{Hse, HseMode};
+use embassy_stm32::time::Hertz;
+
+use cortex_m::singleton;
+use embassy_time::Timer;
+
+const ADC_RB_SIZE: usize = 1024;      // ADC DMA ring buffer size
+const READ_CHUNK: usize = ADC_RB_SIZE / 2; // Must be exactly half of ring buffer
+
+#[embassy_executor::main]
+async fn main(_spawner: Spawner) {
+    info!("ADC→DAC direct pipeline (RB=512, read=256)");
+
+    let mut config = Config::default();
+    config.rcc.hse = Some(Hse {
+        freq: Hertz::mhz(8),
+        mode: HseMode::Oscillator,
+    });
+
+    let p = init(config);
+
+    // ADC DMA ring buffer (owned by the ring-buffered ADC)
+    let adc_dma_buf: &'static mut [u16; ADC_RB_SIZE] =
+        singleton!(: [u16; ADC_RB_SIZE] = [0; ADC_RB_SIZE]).expect("ADC DMA buffer singleton");
+
+    // ADC setup: single channel PC1, ring-buffered DMA
+    let adc = Adc::new_with_config(p.ADC1, Default::default());
+    let mut adc_rb: RingBufferedAdc<ADC1> = adc.into_ring_buffered(
+        p.DMA2_CH0,
+        &mut adc_dma_buf[..],
+        [(p.PC1.degrade_adc(), SampleTime::CYCLES15)].into_iter(),
+        RegularConversionMode::Continuous,
+    );
+    adc_rb.start();
+
+    // DAC setup: PA4, blocking channel (matches your working sine test)
+    let mut dac = DacCh1::new_blocking(p.DAC1, p.PA4);
+
+    loop {
+        // Read exactly half the ring buffer per call
+        let mut buf = [0u16; READ_CHUNK];
+        match adc_rb.read(&mut buf).await {
+            Ok(_) => {
+                // Log a few samples to confirm data flow
+                info!("ADC chunk first 8: {:?}", &buf[0..8]);
+
+                // Output each sample directly to DAC (12-bit right aligned)
+                for &sample in buf.iter() {
+                    let val = sample.min(4095);
+                    dac.set(Value::Bit12Right(val));
+                }
+            }
+            Err(e) => {
+                warn!("ADC read error: {:?}", e);
+                Timer::after_millis(1).await;
+            }
+        }
+    }
+}
